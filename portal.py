@@ -1,6 +1,11 @@
 from fastapi import APIRouter
 
+from .voice_tokens import register_routes as register_voice_routes
+
 router = APIRouter()
+
+# Cloud live-voice token minting -> /api/plugins/portal/voice/token
+register_voice_routes(router)
 
 
 @router.get("/health")
