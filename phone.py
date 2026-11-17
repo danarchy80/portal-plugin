@@ -43,7 +43,6 @@ from typing import Any, Callable
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
-from fastapi.testclient import TestClient  # noqa: F401  (test helper surface)
 
 TOOLSET = "portal"
 
@@ -375,10 +374,13 @@ def register_routes(router: APIRouter) -> None:
         return await _sink("contacts", request)
 
 
-def make_test_client() -> TestClient:
+def make_test_client():
     """A FastAPI app exactly like the host's plugin-host mount (op_asgi:
     ``FastAPI()`` + ``include_router(router)``), for integration tests and
-    manual probes."""
+    manual probes. The TestClient import is deferred so this test-only
+    dependency never breaks a production plugin load."""
+    from fastapi.testclient import TestClient  # local: test-only dep
+
     app = FastAPI()
     app.include_router(router)
     return TestClient(app)
