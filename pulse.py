@@ -2,9 +2,10 @@
 
 HONEST SCOPE: this is NOT upstream's proactive Pulse engine (persona, work
 watch, follow-up turn generation, quiet hours). It is a minimal, deterministic
-on-demand brief — zero LLM calls, zero writes. Every card is derived from a
-read-only snapshot of the profile's ``state.db`` session rows and
-``cron/jobs.json``.
+on-demand brief — zero LLM calls. Every card is derived from a read-only
+snapshot of the profile's ``state.db`` session rows and ``cron/jobs.json``.
+The single write side is the card-outcome sink (POST /pulse/outcome), an
+append log feeding the future deterministic ranking loop.
 
 All state reads are fail-soft: a missing or unreadable store contributes zeros
 instead of raising, because this runs inside the shared plugin host.
@@ -15,13 +16,15 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 
 router = APIRouter()
 
@@ -182,6 +185,114 @@ def _run_sync(coro) -> Any:
 @router.get("/pulse")
 async def pulse_feed():
     return _cards_payload()
+
+
+# ── outcome feedback sink (POST /pulse/outcome) ──────────────────────────────
+#
+# The phone-side PulseRepository.outcome posts {card_id, action, rating?}
+# here (plan 2026-11-17-pulse-phone-side.md). Outcomes land in a per-profile
+# capped append log for the future deterministic ranking loop — no LLM, and
+# a rejected request never touches the store.
+#
+# Storage follows the plugin's sink convention (see phone.py): JSON under
+# ``<profile home>/plugins/portal/pulse/outcomes.json``, atomic rename with
+# 0600 perms. Read-modify-write; concurrent poster races lose an update
+# rather than corrupt the file (single-host v1, same tradeoff as siblings).
+
+VALID_ACTIONS = frozenset({"do_it", "done", "put_off", "dismiss"})
+RATING_MIN = 1
+RATING_MAX = 5
+OUTCOMES_SUBPATH = ("plugins", "portal", "pulse", "outcomes.json")
+OUTCOMES_CAP = 1000
+OUTCOME_SCHEMA_VERSION = 1
+_MAX_CARD_ID_LEN = 128
+
+
+class PulseOutcomeRequest(BaseModel):
+    """Wire shape from the phone; extra keys are ignored, types are strict."""
+
+    card_id: str
+    action: str
+    rating: Optional[int] = None
+
+
+def outcomes_path(home: Path) -> Path:
+    return home.joinpath(*OUTCOMES_SUBPATH)
+
+
+def _read_outcome_entries(path: Path) -> list[dict[str, Any]]:
+    """Entries from an existing store; [] if missing/unreadable/corrupt."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    entries = data.get("entries") if isinstance(data, dict) else None
+    return entries if isinstance(entries, list) else []
+
+
+def store_outcome(
+    card_id: str,
+    action: str,
+    rating: Optional[int] = None,
+    profile: Optional[str] = None,
+) -> Path:
+    """Append one validated outcome for ``profile``; returns the store path.
+
+    Assumes the caller already validated action/rating (the route does). The
+    ranking loop reads this log; nothing else in the plugin consumes it yet.
+    """
+    path = outcomes_path(resolve_home(profile))
+    entries = _read_outcome_entries(path)
+    entries.append({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "card_id": card_id,
+        "action": action,
+        "rating": rating,
+    })
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"schema": OUTCOME_SCHEMA_VERSION, "entries": entries[-OUTCOMES_CAP:]},
+                fh,
+                ensure_ascii=False,
+            )
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    return path
+
+
+@router.post("/pulse/outcome")
+async def pulse_outcome(payload: PulseOutcomeRequest):
+    card_id = payload.card_id.strip()
+    if not card_id or len(card_id) > _MAX_CARD_ID_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"card_id must be a non-empty string of at most "
+                f"{_MAX_CARD_ID_LEN} characters"
+            ),
+        )
+    action = payload.action.strip().lower()  # phone enum may serialize uppercase
+    if action not in VALID_ACTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"unknown action {payload.action!r}; "
+                f"valid actions: {', '.join(sorted(VALID_ACTIONS))}"
+            ),
+        )
+    if payload.rating is not None and not (RATING_MIN <= payload.rating <= RATING_MAX):
+        raise HTTPException(
+            status_code=400,
+            detail=f"rating must be between {RATING_MIN} and {RATING_MAX}",
+        )
+    store_outcome(card_id, action, payload.rating)
+    return {"ok": True, "stored": True}
 
 
 def register_routes(target: APIRouter) -> None:
