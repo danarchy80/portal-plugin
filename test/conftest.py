@@ -4,9 +4,8 @@ host loads directory plugins.
 hermes_cli/plugin_host_child.py::_import_plugin imports the plugin directory
 under the assigned module name (``portal``) via
 ``importlib.util.spec_from_file_location(module_name, <dir>/__init__.py,
-submodule_search_locations=[<dir>])``. The checkout dir is named
-``hermes-portal-plugin``, which plain path-based importing cannot alias to
-``portal``, so register the same spec here before test collection.
+``submodule_search_locations=[<dir>])``. The checkout dir name does not match
+``portal``, so plain path-based importing cannot alias to it, so register the same spec here before test collection.
 """
 
 import importlib.util

@@ -1,1 +1,1 @@
-# hermes-portal-plugin
+# portal-plugin

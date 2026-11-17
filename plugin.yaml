@@ -1,10 +1,10 @@
 name: portal
-label: Hermes Portal
+label: Portal
 kind: tools
 version: 0.1.0-dev
 author: danarchy80
 description: >
-  Host-side companion for the Hermes Portal Android app: Pulse card feed,
+  Host-side companion for the Portal Android app: Pulse card feed,
   opt-in phone-data sinks (location/calendar/contacts), and single-use cloud
   live-voice tokens. Reuses core FCM for encrypted delivery and core audio
   routes for STT/TTS; adds only what core lacks.

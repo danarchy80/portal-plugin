@@ -457,7 +457,7 @@ _PORTAL_LOCATION_SCHEMA = {
     "name": "portal_location",
     "description": (
         "Read the phone's latest synced location (and optionally recent history) "
-        "from the Hermes Portal app. Read-only; returns an error unless the "
+        "from the Portal app. Read-only; returns an error unless the "
         "profile has opted in to location sharing."
     ),
     "parameters": {
@@ -475,7 +475,7 @@ _PORTAL_LOCATION_SCHEMA = {
 _PORTAL_CALENDAR_SCHEMA = {
     "name": "portal_calendar",
     "description": (
-        "Read calendar events synced from the phone by the Hermes Portal app. "
+        "Read calendar events synced from the phone by the Portal app. "
         "Defaults to upcoming events. Read-only; requires the profile's "
         "calendar opt-in."
     ),
@@ -492,7 +492,7 @@ _PORTAL_CALENDAR_SCHEMA = {
 _PORTAL_CONTACTS_SCHEMA = {
     "name": "portal_contacts",
     "description": (
-        "Read contacts synced from the phone by the Hermes Portal app, "
+        "Read contacts synced from the phone by the Portal app, "
         "optionally filtered by a name/note substring. Read-only; requires "
         "the profile's contacts opt-in. Returns [] before any sync."
     ),
