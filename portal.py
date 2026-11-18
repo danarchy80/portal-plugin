@@ -26,6 +26,16 @@ except ImportError:  # pragma: no cover - depends on task sequencing
 if _phone is not None:
     _phone.register_routes(router)
 
+# Remote terminal (opt-in host PTY sessions) -> /api/plugins/portal/term/*.
+# Same optional-module pattern: routes are flat-registered, and a pushed
+# plugin package must import cleanly even if this module were absent.
+try:
+    from . import term as _term
+except ImportError:  # pragma: no cover - depends on task sequencing
+    _term = None
+if _term is not None:
+    _term.register_routes(router)
+
 
 @router.get("/health")
 async def health():
