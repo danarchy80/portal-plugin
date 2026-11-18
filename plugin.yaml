@@ -1,6 +1,6 @@
 name: portal
 label: Portal
-kind: tools
+kind: standalone
 version: 0.1.0-dev
 author: danarchy80
 description: >
