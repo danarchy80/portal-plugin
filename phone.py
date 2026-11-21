@@ -1,4 +1,4 @@
-"""Opt-in phone-data sinks: location / calendar / contacts.
+"""Opt-in phone-data sinks: location / calendar / contacts / health.
 
 Privacy model (plan 2026-11-17-portal-plugin.md, Task 3 + Global Constraints):
 
@@ -46,7 +46,12 @@ from fastapi.responses import JSONResponse
 
 TOOLSET = "portal"
 
-OPT_IN_CLASSES = ("location", "calendar", "contacts")
+OPT_IN_CLASSES = ("location", "calendar", "contacts", "health")
+
+# Health record vocabulary (Portal app posts Health Connect summaries).
+HEALTH_TYPES = ("steps", "heart_rate", "sleep_duration", "weight")
+HEALTH_SOURCES = ("health_connect",)
+MAX_HEALTH_VALUE = 10_000_000
 
 # Hard caps. Anything bigger is refused outright — these sinks are tiny
 # encrypted envelopes, not a blob store.
@@ -67,11 +72,13 @@ _PLAIN_FIELDS: dict[str, dict[str, int]] = {
     "location": {"label": 120},
     "calendar": {"id": 64, "title": 500, "location": 200},
     "contacts": {"name": 200, "note": 500},
+    "health": {"type": 32, "unit": 16, "source": 32},
 }
 _TIME_FIELDS = {
     "location": (("timestamp", True),),
     "calendar": (("start", True), ("end", False)),
     "contacts": (),
+    "health": (("timestamp", True), ("end_timestamp", False)),
 }
 
 _ERR_OPT_IN = (
@@ -166,6 +173,7 @@ _ALLOWED_FIELDS: dict[str, set[str]] = {
     "location": {"lat", "lng", "accuracy_m"},
     "calendar": set(),
     "contacts": set(),
+    "health": {"value"},
 }
 
 
@@ -228,6 +236,23 @@ def _validate_record(cls: str, record: Any) -> dict:
             if not isinstance(accuracy, (int, float)) or isinstance(accuracy, bool) or accuracy < 0:
                 raise ValueError("accuracy_m must be a non-negative number")
             out["accuracy_m"] = float(accuracy)
+    if cls == "health":
+        if out.get("type") not in HEALTH_TYPES:
+            raise ValueError(f"type must be one of {list(HEALTH_TYPES)}")
+        if not out.get("unit"):
+            raise ValueError("unit is required (e.g. count, bpm, min, kg)")
+        if out.get("source") not in HEALTH_SOURCES:
+            raise ValueError(f"source must be one of {list(HEALTH_SOURCES)}")
+        value = record.get("value")
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError("value must be a number")
+        if not (0 <= float(value) <= MAX_HEALTH_VALUE):
+            raise ValueError(f"value out of range [0, {MAX_HEALTH_VALUE}]")
+        out["value"] = float(value)
+        # Both timestamps are strict fixed-width %Y-%m-%dT%H:%M:%SZ here, so
+        # lexicographic order equals chronological order.
+        if "end_timestamp" in out and out["end_timestamp"] < out["timestamp"]:
+            raise ValueError("end_timestamp must be >= timestamp")
     return out
 
 
@@ -373,6 +398,11 @@ def register_routes(router: APIRouter) -> None:
         """Receive an encrypted contacts sync from the Portal app (opt-in gated)."""
         return await _sink("contacts", request)
 
+    @router.post("/phone/health")
+    async def phone_health_sink(request: Request):
+        """Receive a health-metrics sync from the Portal app (opt-in gated)."""
+        return await _sink("health", request)
+
 
 def make_test_client():
     """A FastAPI app exactly like the host's plugin-host mount (op_asgi:
@@ -453,6 +483,128 @@ def _handle_portal_contacts(args: dict, **kw) -> str:
     return json.dumps(out, ensure_ascii=False)
 
 
+def _handle_portal_health(args: dict, **kw) -> str:
+    if (err := _opted_or_feed("health")) is not None:
+        return err
+    store = read_store("health")
+    records = store["records"]
+    rtype = args.get("type")
+    if isinstance(rtype, str) and rtype.strip():
+        rtype = rtype.strip()
+        if rtype not in HEALTH_TYPES:
+            return _tool_error(f"type must be one of {list(HEALTH_TYPES)}")
+        records = [r for r in records if r.get("type") == rtype]
+    limit = args.get("limit", 50)
+    limit = 50 if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 else min(limit, 500)
+    out = {"ok": True, "class": "health", "updated_at": store["updated_at"],
+           "count": len(records), "records": records[-limit:]}
+    if rtype:
+        out["type"] = rtype
+    return json.dumps(out, ensure_ascii=False)
+
+
+# --------------------------------------------------------------------------
+# agent-triggered locate (portal_locate_phone)
+# --------------------------------------------------------------------------
+
+LOCATE_KIND = "portal_locate"
+LOCATE_TIMEOUT_S = 45.0
+LOCATE_POLL_INTERVAL_S = 1.0
+
+
+def _current_profile() -> str:
+    """Profile id for this process's Hermes home (registration files key
+    devices by this name). Falls back to "default" outside a profile tree or
+    in a bare test venv without hermes_constants."""
+    try:
+        from hermes_constants import get_hermes_home, profile_name_for_home
+        name = profile_name_for_home(get_hermes_home())
+        if name:
+            return name
+    except Exception:
+        pass
+    return "default"
+
+
+def _send_locate_ping(profile: str, payload: dict) -> dict:
+    """Push ``payload`` to every FCM device registered for ``profile``.
+
+    Thin seam over ``hermes_cli.fcm_notifier`` (in-process import: the plugin
+    runs inside the gateway process). Encryption rides the module's own
+    ``_send_one`` -> ``_encrypt_payload`` path (AES-256-GCM, base64
+    nonce||ct||tag in ``data["encrypted"]``) — the exact wire format the app
+    already decrypts — and the service-account auth path stays core's.
+    Returns ``{"ok": bool, ...}``; never raises; logs nothing secret.
+    """
+    try:
+        from hermes_cli import fcm_notifier
+    except ImportError:
+        return {"ok": False,
+                "error": "hermes_cli.fcm_notifier is not importable in this process"}
+    try:
+        regs = fcm_notifier._load_registrations()
+        devices = [(token, reg) for token, reg in regs.items()
+                   if reg.get("profile") == profile and reg.get("encryption_key")]
+        if not devices:
+            return {"ok": False,
+                    "error": f"no FCM-registered device for profile {profile!r}"}
+        sent = sum(1 for token, reg in devices
+                   if fcm_notifier._send_one(token, reg["encryption_key"], payload))
+    except Exception as exc:
+        return {"ok": False,
+                "error": f"FCM locate ping failed: {type(exc).__name__}: {exc}"}
+    if not sent:
+        return {"ok": False, "error": "FCM send failed (service account not "
+                                      "configured, or delivery error — see gateway log)"}
+    return {"ok": True, "devices": sent}
+
+
+def _find_fresh_location(requested_at: str) -> dict | None:
+    """Newest location record whose timestamp is >= requested_at (strict
+    fixed-width %Y-%m-%dT%H:%M:%SZ, so lexicographic == chronological)."""
+    for record in reversed(read_store("location")["records"]):
+        ts = record.get("timestamp")
+        if isinstance(ts, str) and ts >= requested_at:
+            return record
+    return None
+
+
+def _handle_portal_locate_phone(args: dict, **kw) -> str:
+    """Ping the phone for a fresh GPS fix and wait for it to land in the
+    location store. Never raises: every failure becomes structured JSON."""
+    try:
+        if (err := _opted_or_feed("location")) is not None:
+            return err
+        profile = args.get("profile")
+        profile = profile.strip() if isinstance(profile, str) and profile.strip() else _current_profile()
+        requested_at = _now_iso()
+        payload = {"kind": LOCATE_KIND, "requested_at": requested_at}
+        ping = _send_locate_ping(profile, payload)
+        if not isinstance(ping, dict) or not ping.get("ok"):
+            message = ping.get("error") if isinstance(ping, dict) else None
+            return json.dumps({"ok": False, "error": message or "locate ping failed",
+                               "requested_at": requested_at}, ensure_ascii=False)
+        deadline = time.monotonic() + LOCATE_TIMEOUT_S
+        while True:
+            fresh = _find_fresh_location(requested_at)
+            if fresh is not None:
+                return json.dumps({"ok": True, "stale": False,
+                                   "requested_at": requested_at, "record": fresh},
+                                  ensure_ascii=False)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(LOCATE_POLL_INTERVAL_S, remaining))
+        records = read_store("location")["records"]
+        out = {"ok": True, "stale": True, "requested_at": requested_at,
+               "record": records[-1] if records else None,
+               "note": f"no fresh fix arrived within {LOCATE_TIMEOUT_S:.0f}s"
+                       + ("" if records else "; no location has ever been synced")}
+        return json.dumps(out, ensure_ascii=False)
+    except Exception as exc:
+        return _tool_error(f"portal_locate_phone failed: {type(exc).__name__}: {exc}")
+
+
 _PORTAL_LOCATION_SCHEMA = {
     "name": "portal_location",
     "description": (
@@ -505,15 +657,61 @@ _PORTAL_CONTACTS_SCHEMA = {
     },
 }
 
+_PORTAL_HEALTH_SCHEMA = {
+    "name": "portal_health",
+    "description": (
+        "Read health metrics synced from the phone by the Portal app "
+        "(steps, heart_rate, sleep_duration, weight). Returns the latest "
+        "snapshot, optionally filtered by type. Read-only; requires the "
+        "profile's health opt-in. Returns [] before any sync."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "type": {
+                "type": "string",
+                "enum": list(HEALTH_TYPES),
+                "description": "Only return records of this metric type.",
+            },
+            "limit": {"type": "integer", "description": "Max records to return (default 50)."},
+        },
+        "required": [],
+    },
+}
+
+_PORTAL_LOCATE_PHONE_SCHEMA = {
+    "name": "portal_locate_phone",
+    "description": (
+        "Ask the phone for a fresh GPS fix now: sends an encrypted locate "
+        "push over FCM, then waits up to 45 s for a location record newer "
+        "than the request to arrive. Returns the fresh record (stale=false), "
+        "or the last-known record with stale=true on timeout. Requires the "
+        "profile's location opt-in and a registered FCM device."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "profile": {
+                "type": "string",
+                "description": "FCM registration profile to ping (defaults to this host's profile).",
+            },
+        },
+        "required": [],
+    },
+}
+
 TOOL_SPECS: list[tuple[dict, Callable]] = [
     (_PORTAL_LOCATION_SCHEMA, _handle_portal_location),
     (_PORTAL_CALENDAR_SCHEMA, _handle_portal_calendar),
     (_PORTAL_CONTACTS_SCHEMA, _handle_portal_contacts),
+    (_PORTAL_HEALTH_SCHEMA, _handle_portal_health),
+    (_PORTAL_LOCATE_PHONE_SCHEMA, _handle_portal_locate_phone),
 ]
 
 
 def register_phone_tools(ctx) -> None:
-    """Register the three read-only phone-data tools (plan Task 3 step 4).
+    """Register the read-only phone-data tools + portal_locate_phone (plan
+    Task 3 step 4; health/locate extend the same site).
 
     No check_fn gating: the manifest already advertises the tools, and an
     opted-out profile should see the clear opt-in error from the handler,
@@ -529,7 +727,7 @@ def register_phone_tools(ctx) -> None:
 # --------------------------------------------------------------------------
 
 def _cli(argv: list[str]) -> int:
-    usage = "usage: python -m portal.phone {opt-in|opt-out|status} [location|calendar|contacts]"
+    usage = "usage: python -m portal.phone {opt-in|opt-out|status} [location|calendar|contacts|health]"
     if not argv:
         print(usage)
         return 2

@@ -177,10 +177,11 @@ class _Ctx:
         self.tools[name] = (toolset, schema, handler)
 
 
-def test_register_registers_the_three_tools():
+def test_register_registers_the_phone_tools():
     ctx = _Ctx()
     assert register(ctx) == {}
-    assert {"portal_location", "portal_calendar", "portal_contacts"} <= set(ctx.tools)
+    assert {"portal_location", "portal_calendar", "portal_contacts",
+            "portal_health", "portal_locate_phone"} <= set(ctx.tools)
     for name, (toolset, schema, handler) in ctx.tools.items():
         assert toolset == "portal", name
         assert schema["name"] and callable(handler)
@@ -194,13 +195,124 @@ def _mounted_routes():
     return {r.path: r.methods for r in router.routes if isinstance(r, APIRoute)}
 
 
-def test_router_exposes_the_three_phone_sinks():
+def test_router_exposes_the_phone_sinks():
     routes = _mounted_routes()
     phone_paths = {p for p in routes if p.startswith("/phone/")}
-    assert phone_paths == {"/phone/location", "/phone/calendar", "/phone/contacts"}
+    assert phone_paths == {"/phone/location", "/phone/calendar",
+                           "/phone/contacts", "/phone/health"}
     for path in phone_paths:
         assert routes[path] == {"POST"}
 
 
 def test_health_route_still_mounted():
     assert "/health" in _mounted_routes()
+
+
+# ---------------------------------------------------------------- health
+
+def _health(**extra):
+    record = {
+        "type": "steps",
+        "value": 8123,
+        "unit": "count",
+        "timestamp": "2026-11-21T12:00:00Z",
+        "source": "health_connect",
+    }
+    record.update(extra)
+    return record
+
+
+def test_health_post_refused_until_health_opts_in(client, profile_home):
+    resp = client.post("/phone/health", json={"records": [_health()]})
+    assert resp.status_code == 403
+    assert "opt-in" in resp.json()["error"]
+
+
+def test_health_round_trip(client, profile_home):
+    phone.set_opt_in("health", True)
+    records = [
+        _health(),
+        _health(type="sleep_duration", value=462, unit="min",
+                timestamp="2026-11-21T02:00:00Z", end_timestamp="2026-11-21T09:42:00Z"),
+    ]
+    resp = client.post("/phone/health", json={"class": "health", "records": records})
+    assert resp.status_code == 201
+    assert resp.json()["stored"] == 2
+    store_file = profile_home / "plugins" / "portal" / "phone" / "health.json"
+    assert store_file.is_file()
+    assert store_file.stat().st_mode & 0o077 == 0  # owner-only (0600)
+    on_disk = json.loads(store_file.read_text())
+    assert on_disk["records"][0]["value"] == 8123
+    assert on_disk["records"][1]["end_timestamp"] == "2026-11-21T09:42:00Z"
+
+
+def test_health_bad_type_rejected(client, profile_home):
+    phone.set_opt_in("health", True)
+    resp = client.post("/phone/health", json={"records": [_health(type="glucose")]})
+    assert resp.status_code == 400
+    assert "type" in resp.json()["error"]
+
+
+def test_health_non_numeric_value_rejected(client, profile_home):
+    phone.set_opt_in("health", True)
+    resp = client.post("/phone/health", json={"records": [_health(value="many")]})
+    assert resp.status_code == 400
+    assert "value" in resp.json()["error"]
+    resp = client.post("/phone/health", json={"records": [_health(value=True)]})
+    assert resp.status_code == 400
+
+
+def test_health_value_out_of_range_rejected(client, profile_home):
+    phone.set_opt_in("health", True)
+    resp = client.post("/phone/health", json={"records": [_health(value=10_000_001)]})
+    assert resp.status_code == 400
+    resp = client.post("/phone/health", json={"records": [_health(value=-1)]})
+    assert resp.status_code == 400
+
+
+def test_health_fractional_second_timestamp_rejected(client, profile_home):
+    phone.set_opt_in("health", True)
+    resp = client.post("/phone/health",
+                       json={"records": [_health(timestamp="2026-11-21T12:00:00.500Z")]})
+    assert resp.status_code == 400
+    assert "timestamp" in resp.json()["error"]
+
+
+def test_health_end_before_start_rejected(client, profile_home):
+    phone.set_opt_in("health", True)
+    resp = client.post("/phone/health",
+                       json={"records": [_health(type="sleep_duration", unit="min",
+                                                 timestamp="2026-11-21T09:00:00Z",
+                                                 end_timestamp="2026-11-21T02:00:00Z")]})
+    assert resp.status_code == 400
+    assert "end_timestamp" in resp.json()["error"]
+
+
+def test_health_wrong_source_and_missing_unit_rejected(client, profile_home):
+    phone.set_opt_in("health", True)
+    resp = client.post("/phone/health", json={"records": [_health(source="google_fit")]})
+    assert resp.status_code == 400
+    resp = client.post("/phone/health", json={"records": [_health(unit="")]})
+    assert resp.status_code == 400
+
+
+def test_portal_health_error_when_opted_out(profile_home):
+    out = json.loads(phone._handle_portal_health({}))
+    assert "error" in out and "opt-in" in out["error"]
+
+
+def test_portal_health_reads_back_and_filters_by_type(client, profile_home):
+    phone.set_opt_in("health", True)
+    phone.ingest("health", {"records": [
+        _health(),
+        _health(type="heart_rate", value=61, unit="bpm", timestamp="2026-11-21T12:05:00Z"),
+        _health(type="steps", value=9500, timestamp="2026-11-21T13:00:00Z"),
+    ]})
+    everything = json.loads(phone._handle_portal_health({}))
+    assert everything["ok"] is True and everything["count"] == 3
+    assert everything["updated_at"]
+    steps = json.loads(phone._handle_portal_health({"type": "steps"}))
+    assert steps["type"] == "steps"
+    assert [r["value"] for r in steps["records"]] == [8123.0, 9500.0]
+    bad = json.loads(phone._handle_portal_health({"type": "glucose"}))
+    assert "error" in bad

@@ -16,7 +16,7 @@ register_voice_routes(router)
 # Pulse card feed -> /api/plugins/portal/pulse
 register_pulse_routes(router)
 
-# Phone-data sinks -> /api/plugins/portal/phone/{location,calendar,contacts}.
+# Phone-data sinks -> /api/plugins/portal/phone/{location,calendar,contacts,health}.
 # Optional module (Task 3): absent until that task lands its files, and a
 # pushed plugin package must import cleanly without it.
 try:
@@ -53,5 +53,5 @@ def register(ctx):
     if hasattr(ctx, "register_tool"):
         register_pulse_tools(ctx)  # pulse_get
         if _phone is not None:
-            _phone.register_phone_tools(ctx)  # portal_location/calendar/contacts
+            _phone.register_phone_tools(ctx)  # portal_location/calendar/contacts/health + portal_locate_phone
     return {}

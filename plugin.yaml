@@ -4,16 +4,19 @@ kind: standalone
 version: 0.1.0-dev
 author: danarchy80
 description: >
-  Host-side companion for the Portal Android app: Pulse card feed,
-  opt-in phone-data sinks (location/calendar/contacts), and single-use cloud
-  live-voice tokens. Reuses core FCM for encrypted delivery and core audio
-  routes for STT/TTS; adds only what core lacks.
+  Host-side companion for the Portal Android app: Pulse card feed, opt-in
+  phone-data sinks (location/calendar/contacts/health), agent-triggered
+  phone locate, and single-use cloud live-voice tokens. Reuses core FCM for
+  encrypted delivery and core audio routes for STT/TTS; adds only what core
+  lacks.
 requires_hermes: ">=0.21.5"
 provides_tools:
   - pulse_get
   - portal_location
   - portal_calendar
   - portal_contacts
+  - portal_health
+  - portal_locate_phone
 provides_hooks: []
 provides_middleware: []
 requires_env: []
