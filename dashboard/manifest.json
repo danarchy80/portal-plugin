@@ -3,7 +3,7 @@
   "label": "Portal",
   "description": "Host-side companion for the Portal Android app: opt-in phone-data sinks (location/calendar/contacts), Pulse card feed, and single-use cloud live-voice tokens.",
   "icon": "Smartphone",
-  "version": "0.1.0-dev",
+  "version": "0.2.0-dev",
   "tab": { "hidden": true },
   "api": "api.py"
 }

@@ -1,5 +1,6 @@
 from fastapi import APIRouter
 
+from .capabilities import register_routes as register_capabilities_routes
 from .pulse import register_tools as register_pulse_tools
 from .pulse import register_routes as register_pulse_routes
 from .voice_tokens import register_routes as register_voice_routes
@@ -15,6 +16,9 @@ register_voice_routes(router)
 
 # Pulse card feed -> /api/plugins/portal/pulse
 register_pulse_routes(router)
+
+# Read-only calendar capability probe -> /api/plugins/portal/capabilities
+register_capabilities_routes(router)
 
 # Phone-data sinks -> /api/plugins/portal/phone/{location,calendar,contacts,health}.
 # Optional module (Task 3): absent until that task lands its files, and a
